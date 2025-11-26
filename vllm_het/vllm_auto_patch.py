@@ -94,7 +94,12 @@ def patch_parallel_state(mod: ModuleType):
                 P2P_RANK_IP_CACHE["world"] = p2p.get_rank_ip_port_map(group = self.cpu_group)
             elif group_name == "pp":
                 rank_ip = P2P_RANK_IP_CACHE.get("world", None)
-                p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip)
+                # p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip)
+                try:
+                    device_id = int(local_rank)
+                except Exception:
+                    device_id = 0
+                p2p.init_p2p_comm(group = self.cpu_group, rankip = rank_ip, device_id = device_id)
 
         def vllm_het_send(
             self,

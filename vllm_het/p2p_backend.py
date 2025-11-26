@@ -2,6 +2,10 @@ from abc import ABC, abstractmethod
 from typing import List, Any, Optional
 import torch
 from enum import Enum
+import hmc
+import threading
+import struct
+import time
 
 class P2pBackend(Enum):
     HMCComm = 1
@@ -60,26 +64,83 @@ class CommBase(ABC):
 # HMC Communicator
 #####################################################
 class HMCRequest(Request):
-    def _wait_impl(self, timeout):
-        return super()._wait_impl(timeout)
-    
+    def __init__(self, thread: threading.Thread):
+        super().__init__()
+        self._thread = thread
+        thread.start()
+
+    def _wait_impl(self, timeout: Optional[float]) -> bool:
+        self._thread.join(timeout)
+        if not self._thread.is_alive():
+            self._completed = True
+        return self._completed
+
+
 class HMCComm(CommBase):
-    def __init__(self, rank: int, rank_ip: dict = {}):
+    def __init__(self, rank: int, rank_ip: dict = {}, device_id: int = 0):
         """
         rank_ip: { rank : (192.168.1.2, 12345) }
+        The HMC implementation follows the TCP framing semantics:
+        [4 bytes meta_len][4 bytes data_len] followed by meta and data, but
+        performed as two staged send/recv calls using the HMC ConnBuffer.
         """
         super().__init__()
+        self.connections = {}
         self.rank = rank
-        self.rank_ip=rank_ip
+        self.rank_ip = rank_ip
+        self._buf_size = 16 * 1024 * 1024
 
-    def isend(self, tensor: torch.Tensor, dst: int):
-        return super().isend(tensor, dst)
-    
-    def irecv(self, tensor: torch.Tensor, src: int):
-        return super().irecv(tensor, src)
-    
+        self._gpu_conn_buf = hmc.ConnBuffer(device_id, self._buf_size, hmc.MemoryType.DEFAULT)
+
+        self._gpu_comm = hmc.Communicator(self._gpu_conn_buf, 1)
+
+        if self.rank in self.rank_ip:
+            ip, port = self.rank_ip[self.rank]
+            try:
+                self._gpu_comm.initServer(ip, port, hmc.ConnType.RDMA)
+            except Exception:
+                raise RuntimeError("HMC initServer failed")
+                pass
+
+    def _ensure_connect(self, dst: int):
+        if dst not in self.connections:
+            ip, port = self.rank_ip[dst]
+            self._gpu_comm.connectTo(dst_ip, dst_port)
+            self.connections[dst] = True
+        if self.checkConn(ip, hmc.ConnType.RDMA) != hmc.status_t.SUCCESS:
+            self._gpu_comm.connectTo(dst_ip, dst_port)
+
+    def make_capsule_from_ptr(ptr: int, name: bytes = b"hmc_buffer"):
+        PyCapsule_New = ctypes.pythonapi.PyCapsule_New
+        PyCapsule_New.restype = ctypes.py_object
+        PyCapsule_New.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+        return PyCapsule_New(ctypes.c_void_p(ptr), name, None)
+
+    def isend(self, tensor: torch.Tensor, dst: int) -> Request:
+        def send_fn():
+            dst_ip, dst_port = self.rank_ip[dst]
+            self._ensure_connect(dst)
+
+            send_capsule =make_capsule_from_ptr(tensor.data_ptr())
+            data_len = tensor.numel() * tensor.element_size()
+            self._gpu_comm.sendDataTo(dst_ip, send_capsule, self._buf_size, hmc.MemoryType.DEFAULT, data_len, hmc.ConnType.RDMA)
+
+        return HMCRequest(threading.Thread(target=send_fn))
+
+    def irecv(self, tensor: torch.Tensor, src: int) -> Request:
+        def recv_fn():
+            src_ip, src_port = self.rank_ip[src]
+
+            dev_tensor = tensor
+            dev_ptr = dev_tensor.data_ptr()
+            recv_capsule = make_capsule_from_ptr(dev_ptr)
+
+            self._comm.recvDataFrom(src_ip, recv_capsule, self._buf_size, hmc.MemoryType.DEFAULT, 0, hmc.ConnType.RDMA)
+
+        return HMCRequest(threading.Thread(target=recv_fn))
+
     def batch_isend_irecv(self, ops):
-        return super().batch_isend_irecv(ops)
+        return ops
     
 #####################################################
 # TCP Communicator
@@ -236,7 +297,7 @@ def get_rank_ip_port_map(group: dist.ProcessGroup) -> Dict[int, Tuple[str, int]]
     print("end rank_ip_map.key keys")
     return rank_ip_map
 
-def init_p2p_comm(group: torch.distributed.ProcessGroup = None, p2p_backend: P2pBackend = P2pBackend.TCPComm, rankip = None):
+def init_p2p_comm(group: torch.distributed.ProcessGroup = None, p2p_backend: P2pBackend = P2pBackend.TCPComm, rankip = None, device_id = 0):
     global _HET_COMM
     if group == None:
         group = torch.distributed.group.WORLD
@@ -244,10 +305,10 @@ def init_p2p_comm(group: torch.distributed.ProcessGroup = None, p2p_backend: P2p
         return
     if p2p_backend == P2pBackend.HMCComm:
         # print(f"Init p2p HMCComm for group {group.group_name}")
-        _HET_COMM[group.group_name] = HMCComm(rank=dist.get_rank(), rank_ip = get_rank_ip_port_map(group))
+        _HET_COMM[group.group_name] = HMCComm(rank=dist.get_rank(), rank_ip = get_rank_ip_port_map(group), device_id=device_id)
     elif p2p_backend == P2pBackend.TCPComm:
         # print(f"Init p2p TCPComm for group {group.group_name}")
-        _HET_COMM[group.group_name] = TCPComm(rank=dist.get_rank(), rank_ip = rankip)
+        _HET_COMM[group.group_name] = TCPComm(rank=dist.get_rank(), rank_ip = get_rank_ip_port_map(group))
     else:
         raise ValueError("p2p_backend must be set")
         
